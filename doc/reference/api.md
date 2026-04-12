@@ -85,9 +85,10 @@
 
 #### ScalingAdapter
 
- Field  | Description
---------|----------------------------------------------------------------------------
- enable | bool — whether the scaling adapter is enabled for the role (default=false)
+ Field           | Description
+-----------------|-------------------------------------------------------------------------------------------------------------------
+ enable          | bool — whether the scaling adapter is enabled for the role (default=false)
+ scaleDownPolicy | *ScaleDownPolicyType — scale-down behavior during rollout (enum: DeferDuringRollout, Unrestricted; default=Unrestricted)
 
 ## RoleBasedGroupStatus
 

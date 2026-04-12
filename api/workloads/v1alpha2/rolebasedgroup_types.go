@@ -364,7 +364,7 @@ type ScalingAdapter struct {
 	// "DeferDuringRollout" defers scale-down for partition-based workloads
 	// while a rolling update is in progress.
 	// "Unrestricted" allows scale-down at any time.
-	// Defaults to "DeferDuringRollout" when unset.
+	// Defaults to "Unrestricted" when unset.
 	// +optional
 	// +kubebuilder:validation:Enum=DeferDuringRollout;Unrestricted
 	ScaleDownPolicy *ScaleDownPolicyType `json:"scaleDownPolicy,omitempty"`

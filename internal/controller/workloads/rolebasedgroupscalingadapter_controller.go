@@ -24,6 +24,7 @@ import (
 
 	"github.com/pkg/errors"
 	corev1 "k8s.io/api/core/v1"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -39,8 +40,10 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"sigs.k8s.io/rbgs/api/workloads/constants"
 	workloadsv1alpha2 "sigs.k8s.io/rbgs/api/workloads/v1alpha2"
 	applyconfiguration "sigs.k8s.io/rbgs/client-go/applyconfiguration/workloads/v1alpha2"
@@ -69,13 +72,15 @@ func NewRoleBasedGroupScalingAdapterReconciler(mgr ctrl.Manager) *RoleBasedGroup
 // +kubebuilder:rbac:groups=workloads.x-k8s.io,resources=rolebasedgroupscalingadapters/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=workloads.x-k8s.io,resources=rolebasedgroupscalingadapters/finalizers,verbs=update
 func (r *RoleBasedGroupScalingAdapterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	// Fetch the RoleBasedGroupScalingAdapter instance
-	rbgScalingAdapter := &workloadsv1alpha2.RoleBasedGroupScalingAdapter{}
+	// Fetch the RoleBasedGroupScalingAdapter instance.
+	// DeepCopy to avoid mutating the informer cache when modifying conditions.
+	cached := &workloadsv1alpha2.RoleBasedGroupScalingAdapter{}
 	if err := r.client.Get(
-		ctx, types.NamespacedName{Name: req.Name, Namespace: req.Namespace}, rbgScalingAdapter,
+		ctx, types.NamespacedName{Name: req.Name, Namespace: req.Namespace}, cached,
 	); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
+	rbgScalingAdapter := cached.DeepCopy()
 	logger := log.FromContext(ctx).WithValues("rbg-scaling-adapter", klog.KObj(rbgScalingAdapter))
 	ctx = ctrl.LoggerInto(ctx, logger)
 
@@ -131,7 +136,9 @@ func (r *RoleBasedGroupScalingAdapterReconciler) Reconcile(ctx context.Context, 
 				logger.Error(err, "Failed to update status for %s", rbgScalingAdapterName)
 			}
 		}
-		// TODO: currently reconcile unbound adapter by a default reconcile interval, need to implement a rbg event-driven manager
+		// The Watches() on RBG enables event-driven reconciliation for bound adapters.
+		// This RequeueAfter is retained for unbound adapters whose target RBG does not
+		// yet exist (no watch events generated for non-existent objects).
 		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 	}
 
@@ -189,9 +196,54 @@ func (r *RoleBasedGroupScalingAdapterReconciler) Reconcile(ctx context.Context, 
 	desiredReplicas, currentReplicas := rbgScalingAdapter.Spec.Replicas, targetRole.Replicas
 	if desiredReplicas == nil || currentReplicas == nil ||
 		*rbgScalingAdapter.Spec.Replicas == *targetRole.Replicas {
-		// nothing to do
+		if err := r.clearScaleDownDeferredCondition(ctx, rbgScalingAdapter); err != nil {
+			return ctrl.Result{}, err
+		}
 		return ctrl.Result{}, nil
 	}
+
+	// Gate scale-down for partition-based workloads during rolling update.
+	// StatefulSet/LWS delete pods from highest ordinals on scale-down, which are
+	// the already-updated pods (ordinal >= partition). Deferring scale-down until
+	// the rollout completes prevents rollout progress destruction.
+	if *desiredReplicas < *currentReplicas && workloadsv1alpha2.IsStatefulRole(targetRole) {
+		roleStatus, found := rbg.GetRoleStatus(targetRoleName)
+		if found && roleStatus.UpdatedReplicas < roleStatus.Replicas {
+			msg := fmt.Sprintf(
+				"Scale-down to %d replicas deferred (current: %d): partition-based rolling update in progress for role %s (updated %d/%d)",
+				*desiredReplicas, *currentReplicas, targetRoleName,
+				roleStatus.UpdatedReplicas, roleStatus.Replicas)
+
+			logger.Info("Deferring scale-down during partition-based rollout",
+				"desired", *desiredReplicas, "current", *currentReplicas,
+				"updatedReplicas", roleStatus.UpdatedReplicas, "replicas", roleStatus.Replicas)
+
+			// Only emit the event on first deferral, not on every requeue.
+			isFirstDeferral := apimeta.FindStatusCondition(rbgScalingAdapter.Status.Conditions,
+				workloadsv1alpha2.AdapterConditionScaleDownDeferred) == nil
+
+			apimeta.SetStatusCondition(&rbgScalingAdapter.Status.Conditions, metav1.Condition{
+				Type:               workloadsv1alpha2.AdapterConditionScaleDownDeferred,
+				Status:             metav1.ConditionTrue,
+				Reason:             "RollingUpdateInProgress",
+				ObservedGeneration: rbgScalingAdapter.Generation,
+				Message:            msg,
+			})
+			if err := r.patchAdapterStatus(ctx, rbgScalingAdapter); err != nil {
+				return ctrl.Result{}, err
+			}
+
+			if isFirstDeferral {
+				r.recorder.Eventf(rbgScalingAdapter, corev1.EventTypeWarning, ScaleDownDeferred, msg)
+			}
+			return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+		}
+	}
+
+	// Clear condition in memory; the SSA status patch below persists the change
+	// in a single API call together with the replica/lastScaleTime update.
+	apimeta.RemoveStatusCondition(&rbgScalingAdapter.Status.Conditions,
+		workloadsv1alpha2.AdapterConditionScaleDownDeferred)
 
 	logger.Info("Start scaling", "desired replicas", *desiredReplicas, "current replicas", *currentReplicas)
 
@@ -223,6 +275,30 @@ func (r *RoleBasedGroupScalingAdapterReconciler) Reconcile(ctx context.Context, 
 	)
 
 	return ctrl.Result{}, nil
+}
+
+// patchAdapterStatus persists the RBGSA status using SSA, consistent with all
+// other status writes in this controller.
+func (r *RoleBasedGroupScalingAdapterReconciler) patchAdapterStatus(
+	ctx context.Context, rbgScalingAdapter *workloadsv1alpha2.RoleBasedGroupScalingAdapter,
+) error {
+	applyConfig := ToRoleBasedGroupScalingAdapterApplyConfiguration(rbgScalingAdapter).
+		WithStatus(ToRoleBasedGroupScalingAdapterStatusApplyConfiguration(rbgScalingAdapter.Status, false))
+	return utils.PatchObjectApplyConfiguration(ctx, r.client, applyConfig, utils.PatchStatus)
+}
+
+// clearScaleDownDeferredCondition removes the ScaleDownDeferred condition if present
+// and persists the change via SSA status patch.
+func (r *RoleBasedGroupScalingAdapterReconciler) clearScaleDownDeferredCondition(
+	ctx context.Context, rbgScalingAdapter *workloadsv1alpha2.RoleBasedGroupScalingAdapter,
+) error {
+	if apimeta.FindStatusCondition(rbgScalingAdapter.Status.Conditions,
+		workloadsv1alpha2.AdapterConditionScaleDownDeferred) == nil {
+		return nil
+	}
+	apimeta.RemoveStatusCondition(&rbgScalingAdapter.Status.Conditions,
+		workloadsv1alpha2.AdapterConditionScaleDownDeferred)
+	return r.patchAdapterStatus(ctx, rbgScalingAdapter)
 }
 
 func (r *RoleBasedGroupScalingAdapterReconciler) UpdateAdapterOwnerReference(
@@ -280,6 +356,9 @@ func ToRoleBasedGroupScalingAdapterStatusApplyConfiguration(status workloadsv1al
 	if scale {
 		statusApplyConfig = statusApplyConfig.WithLastScaleTime(metav1.Now())
 	}
+	// Always include conditions so SSA clears conditions that were previously set.
+	statusApplyConfig = statusApplyConfig.WithConditions(
+		ToConditionApplyConfigurations(status.Conditions)...)
 	return statusApplyConfig
 }
 
@@ -288,6 +367,12 @@ func (r *RoleBasedGroupScalingAdapterReconciler) SetupWithManager(mgr ctrl.Manag
 	return ctrl.NewControllerManagedBy(mgr).
 		WithOptions(options).
 		For(&workloadsv1alpha2.RoleBasedGroupScalingAdapter{}, builder.WithPredicates(RBGScalingAdapterPredicate())).
+		// Watch RBG objects for rollout status changes. This enables event-driven
+		// reconciliation when a rollout completes, so deferred scale-downs are
+		// released promptly instead of waiting for the RequeueAfter safety net.
+		Watches(&workloadsv1alpha2.RoleBasedGroup{},
+			handler.EnqueueRequestsFromMapFunc(r.findScalingAdaptersByRBG),
+			builder.WithPredicates(rbgStatusChangedPredicate())).
 		Named("workloads-rolebasedgroup-scalingadapter").
 		Complete(r)
 }
@@ -339,6 +424,62 @@ func RBGScalingAdapterPredicate() predicate.Funcs {
 			return false
 		},
 	}
+}
+
+// rbgStatusChangedPredicate returns a predicate that fires only when the
+// RBG's status.roleStatuses changes. This is used by the RBGSA controller's
+// watch on RBG objects to detect rollout completion.
+func rbgStatusChangedPredicate() predicate.Funcs {
+	return predicate.Funcs{
+		CreateFunc: func(e event.CreateEvent) bool {
+			return false
+		},
+		UpdateFunc: func(e event.UpdateEvent) bool {
+			oldRBG, ok1 := e.ObjectOld.(*workloadsv1alpha2.RoleBasedGroup)
+			newRBG, ok2 := e.ObjectNew.(*workloadsv1alpha2.RoleBasedGroup)
+			if !ok1 || !ok2 {
+				return false
+			}
+			return !reflect.DeepEqual(oldRBG.Status.RoleStatuses, newRBG.Status.RoleStatuses)
+		},
+		DeleteFunc: func(e event.DeleteEvent) bool {
+			return false
+		},
+		GenericFunc: func(e event.GenericEvent) bool {
+			return false
+		},
+	}
+}
+
+// findScalingAdaptersByRBG maps an RBG object to the RBGSA(s) that reference it
+// via ScaleTargetRef.Name. This is used as an EventHandler for the RBGSA
+// controller's watch on RBG objects.
+func (r *RoleBasedGroupScalingAdapterReconciler) findScalingAdaptersByRBG(
+	ctx context.Context, obj client.Object,
+) []reconcile.Request {
+	rbg, ok := obj.(*workloadsv1alpha2.RoleBasedGroup)
+	if !ok {
+		return nil
+	}
+
+	var rbgsaList workloadsv1alpha2.RoleBasedGroupScalingAdapterList
+	if err := r.client.List(ctx, &rbgsaList, client.InNamespace(rbg.Namespace)); err != nil {
+		log.FromContext(ctx).Error(err, "Failed to list RBGSAs for RBG", "rbg", klog.KObj(rbg))
+		return nil
+	}
+
+	var requests []reconcile.Request
+	for _, rbgsa := range rbgsaList.Items {
+		if rbgsa.Spec.ScaleTargetRef != nil && rbgsa.Spec.ScaleTargetRef.Name == rbg.Name {
+			requests = append(requests, reconcile.Request{
+				NamespacedName: types.NamespacedName{
+					Name:      rbgsa.Name,
+					Namespace: rbgsa.Namespace,
+				},
+			})
+		}
+	}
+	return requests
 }
 
 func (r *RoleBasedGroupScalingAdapterReconciler) GetTargetRbgFromAdapter(

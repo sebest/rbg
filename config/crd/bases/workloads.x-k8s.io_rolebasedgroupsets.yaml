@@ -33706,6 +33706,15 @@ spec:
                                   description: Enable indicates whether the ScalingAdapter
                                     is enabled for the Role.
                                   type: boolean
+                                scaleDownPolicy:
+                                  description: |-
+                                    ScaleDownPolicy controls scale-down behavior during rolling updates.
+                                    "DeferDuringRollout" defers scale-down for partition-based workloads
+                                    while a rolling update is in progress.
+                                  enum:
+                                  - DeferDuringRollout
+                                  - Unrestricted
+                                  type: string
                               type: object
                             servicePorts:
                               items:

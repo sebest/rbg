@@ -337,11 +337,37 @@ type InstanceComponent struct {
 	Template corev1.PodTemplateSpec `json:"template"`
 }
 
+// ScaleDownPolicyType defines how scale-down interacts with rolling updates.
+type ScaleDownPolicyType string
+
+const (
+	// ScaleDownPolicyDeferDuringRollout defers HPA-driven scale-down for
+	// partition-based workloads while a rolling update is in progress.
+	// This prevents rollout progress destruction caused by StatefulSet/LWS
+	// deleting already-updated pods from the highest ordinals.
+	ScaleDownPolicyDeferDuringRollout ScaleDownPolicyType = "DeferDuringRollout"
+
+	// ScaleDownPolicyUnrestricted allows scale-down at any time, even during
+	// an active rollout. Use with caution: for partition-based workloads,
+	// scale-down during rollout will delete already-updated pods and reset
+	// rollout progress.
+	ScaleDownPolicyUnrestricted ScaleDownPolicyType = "Unrestricted"
+)
+
 type ScalingAdapter struct {
 	// Enable indicates whether the ScalingAdapter is enabled for the Role.
 	// +optional
 	// +kubebuilder:default=false
 	Enable bool `json:"enable,omitempty"`
+
+	// ScaleDownPolicy controls scale-down behavior during rolling updates.
+	// "DeferDuringRollout" defers scale-down for partition-based workloads
+	// while a rolling update is in progress.
+	// "Unrestricted" allows scale-down at any time.
+	// Defaults to "DeferDuringRollout" when unset.
+	// +optional
+	// +kubebuilder:validation:Enum=DeferDuringRollout;Unrestricted
+	ScaleDownPolicy *ScaleDownPolicyType `json:"scaleDownPolicy,omitempty"`
 }
 
 // RoleBasedGroupStatus defines the observed state of RoleBasedGroup.
